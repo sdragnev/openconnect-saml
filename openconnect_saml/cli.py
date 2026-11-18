@@ -1507,6 +1507,44 @@ def _force_utf8_streams() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
+def _dispatch_subcommand(args, parser):
+    """Route a parsed ``args.command`` to its handler (shared by both the
+    subcommand and legacy code paths)."""
+    if args.command == "connect":
+        return _handle_connect(args, parser)
+    if args.command == "profiles":
+        return _handle_profiles_command(args)
+    if args.command == "status":
+        return _handle_status_command(args)
+    if args.command == "completion":
+        return _handle_completion_command(args)
+    if args.command == "setup":
+        return _handle_setup_command(args)
+    if args.command == "config":
+        return _handle_config_command(args)
+    if args.command == "doctor":
+        return _handle_doctor_command(args)
+    if args.command == "history":
+        return _handle_history_command(args)
+    if args.command == "killswitch":
+        return _handle_killswitch_command(args)
+    if args.command == "gui":
+        return _handle_gui_command()
+    if args.command == "tui":
+        return _handle_tui_command()
+    if args.command == "run":
+        return _handle_run_command(args)
+    if args.command == "disconnect":
+        return _handle_disconnect_command(args)
+    if args.command == "sessions":
+        return _handle_sessions_command(args)
+    if args.command == "groups":
+        return _handle_groups_command(args)
+
+    parser.print_help()
+    return 0
+
+
 def main():
     _force_utf8_streams()
     argv = sys.argv[1:]
@@ -1534,52 +1572,33 @@ def main():
         _apply_quiet_flag(args)
         _maybe_first_run_hint(argv)
 
-        if args.command == "connect":
-            return _handle_connect(args, parser)
-        if args.command == "profiles":
-            return _handle_profiles_command(args)
-        if args.command == "status":
-            return _handle_status_command(args)
-        if args.command == "completion":
-            return _handle_completion_command(args)
-        if args.command == "setup":
-            return _handle_setup_command(args)
-        if args.command == "config":
-            return _handle_config_command(args)
-        if args.command == "doctor":
-            return _handle_doctor_command(args)
-        if args.command == "history":
-            return _handle_history_command(args)
-        if args.command == "killswitch":
-            return _handle_killswitch_command(args)
-        if args.command == "gui":
-            return _handle_gui_command()
-        if args.command == "tui":
-            return _handle_tui_command()
-        if args.command == "run":
-            return _handle_run_command(args)
-        if args.command == "disconnect":
-            return _handle_disconnect_command(args)
-        if args.command == "sessions":
-            return _handle_sessions_command(args)
-        if args.command == "groups":
-            return _handle_groups_command(args)
-
-        parser.print_help()
-        return 0
+        return _dispatch_subcommand(args, parser)
 
     # Legacy mode: no subcommand
     parser = create_legacy_argparser()
     args, unknown = parser.parse_known_args(argv)
     if unknown and unknown[0] == "--":
         unknown = unknown[1:]
+    # A subcommand written *after* global flags (e.g.
+    # ``openconnect-saml --no-totp connect rcc``) is not recognised by the
+    # legacy parser and would otherwise be forwarded verbatim to
+    # openconnect, producing "Too many arguments on command line". Hoist it
+    # back onto ``args`` so it dispatches like a normal subcommand.
+    if unknown and unknown[0] in _KNOWN_SUBCOMMANDS:
+        args.command = unknown[0]
+        unknown = unknown[1:]
+        if args.command == "connect" and unknown and not unknown[0].startswith("-"):
+            args.profile_name = unknown[0]
+            unknown = unknown[1:]
     args.openconnect_args = list(getattr(args, "openconnect_args", []) or []) + unknown
     if getattr(args, "version", False):
         return _print_version(check=getattr(args, "check", False))
     _apply_config_override(args)
     _apply_quiet_flag(args)
-    args.profile_name = None
-    return _handle_connect(args, parser)
+    if getattr(args, "command", None) is None:
+        args.profile_name = None
+        return _handle_connect(args, parser)
+    return _dispatch_subcommand(args, parser)
 
 
 if __name__ == "__main__":

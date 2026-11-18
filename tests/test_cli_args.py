@@ -690,3 +690,45 @@ class TestOpenConnectArgs:
     def test_unknown_flag_goes_through(self, parser):
         args, unknown = parser.parse_known_args(["-s", "vpn.example.com", "--no-dtls"])
         assert unknown == ["--no-dtls"]
+
+
+def test_global_flags_before_subcommand_do_not_leak_to_openconnect(monkeypatch):
+    """`openconnect-saml -l DEBUG --browser chrome --no-totp connect rcc`
+    must dispatch as the ``connect`` subcommand, not forward ``connect rcc``
+    to openconnect's argv (issue: "Too many arguments on command line").
+    """
+    import sys
+
+    from openconnect_saml import cli
+
+    captured = {}
+
+    def fake_handle_connect(args, parser):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(cli, "_handle_connect", fake_handle_connect)
+    monkeypatch.setattr(cli, "_maybe_first_run_hint", lambda argv: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "openconnect-saml",
+            "-l",
+            "DEBUG",
+            "--browser",
+            "chrome",
+            "--no-totp",
+            "--notify",
+            "connect",
+            "rcc",
+        ],
+    )
+
+    cli.main()
+
+    args = captured["args"]
+    assert args.command == "connect"
+    assert args.profile_name == "rcc"
+    assert "connect" not in args.openconnect_args
+    assert "rcc" not in args.openconnect_args

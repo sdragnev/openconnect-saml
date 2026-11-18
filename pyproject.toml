@@ -116,3 +116,8 @@ show_missing = true
 # structurally lower because killswitch.py (iptables/pf), some
 # signal helpers and a few pgrep/proc paths are unreachable there.
 fail_under = 73
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.2",
+]
