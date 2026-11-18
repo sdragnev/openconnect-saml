@@ -36,8 +36,16 @@ class Authenticator:
         chrome_channel=None,
         chrome_executable=None,
         chrome_user_data_dir=None,
+        group_selector=None,
     ):
         self.host = host
+        # Optional callback ``(groups, selected, requested) -> str | None``
+        # used when the gateway answers with a group-selection form and the
+        # requested --authgroup is not one of the offered groups.
+        self.group_selector = group_selector
+        # Group actually sent in <group-select>; starts as the profile's
+        # authgroup and may be replaced after a group-selection round-trip.
+        self.auth_group = getattr(host, "name", "") or ""
         self.proxy = proxy
         self.chrome_channel = chrome_channel
         self.chrome_executable = chrome_executable
@@ -61,8 +69,12 @@ class Authenticator:
         response = self._start_authentication()
 
         # Handle client-cert-request by retrying without cert (#164)
+        no_cert = False
         if isinstance(response, CertRequestResponse):
+            no_cert = True
             response = self._start_authentication(no_cert=True)
+
+        response = self._resolve_group_selection(response, no_cert=no_cert)
 
         if not isinstance(response, AuthRequestResponse):
             extra = {}
@@ -118,8 +130,61 @@ class Authenticator:
         self.host.address = response.url
         logger.debug("Auth target url", url=self.host.vpn_url)
 
+    def _resolve_group_selection(self, response, no_cert=False):
+        """Handle a gateway that answers the init request with a group list.
+
+        When the ``<group-select>`` we sent does not name a valid tunnel
+        group (e.g. after the admins renamed the groups), the ASA falls back
+        to its default group and returns a ``<select name="group_list">``
+        form instead of an SSO login URL. Like openconnect, we pick the
+        right group and redo the init request with it.
+        """
+        tried = set()
+        while isinstance(response, GroupSelectResponse):
+            if self.auth_group and _match_group(self.auth_group, [response.selected]):
+                # We asked for this exact group and the gateway still wants a
+                # non-SSO form: the group exists but does not use SAML.
+                raise AuthGroupSelectionError(
+                    f"VPN group '{response.selected}' does not offer SAML/SSO login "
+                    "(the gateway asked for a username/password form instead). "
+                    f"Available groups: {_format_groups(response.groups)}. "
+                    'Pick a different one with --authgroup "<group>".'
+                )
+
+            choice = _match_group(self.auth_group, response.groups) if self.auth_group else None
+            if choice is None:
+                if self.auth_group:
+                    logger.warning(
+                        "Requested VPN group is not offered by the gateway",
+                        requested=self.auth_group,
+                        available=response.groups,
+                    )
+                if self.group_selector is not None:
+                    choice = self.group_selector(
+                        response.groups, response.selected, self.auth_group
+                    )
+            if not choice or choice in tried:
+                raise AuthGroupSelectionError(
+                    "The VPN gateway asks for a group selection and "
+                    + (
+                        f"'{self.auth_group}' is not one of the offered groups. "
+                        if self.auth_group
+                        else "no group was given. "
+                    )
+                    + f"Available groups: {_format_groups(response.groups)}. "
+                    'Re-run with --authgroup "<group>" (or set the profile\'s '
+                    "name to the group)."
+                )
+            tried.add(choice)
+            logger.info("Selecting VPN group", group=choice)
+            self.auth_group = choice
+            response = self._start_authentication(no_cert=no_cert)
+        return response
+
     def _start_authentication(self, no_cert=False):
-        request = _create_auth_init_request(self.host, self.host.vpn_url, self.version, no_cert)
+        request = _create_auth_init_request(
+            self.host, self.host.vpn_url, self.version, no_cert, group=self.auth_group
+        )
         # Never log raw auth bodies at DEBUG: the request/response envelopes
         # carry SAML/auth material and (in the finish step) the VPN session
         # token. Logging them verbatim at --log-level DEBUG would write
@@ -207,6 +272,10 @@ class AuthResponseError(AuthenticationError):
     pass
 
 
+class AuthGroupSelectionError(AuthenticationError):
+    """The gateway wants a group selection we could not satisfy."""
+
+
 class SSLLegacyAdapter(requests.adapters.HTTPAdapter):
     """HTTP adapter that enables legacy SSL renegotiation (#81).
 
@@ -286,7 +355,7 @@ def create_probe_session(proxy, ssl_legacy=False, verify_tls=True):
 E = objectify.ElementMaker(annotate=False)
 
 
-def _create_auth_init_request(host, url, version, no_cert=False):
+def _create_auth_init_request(host, url, version, no_cert=False, group=None):
     ConfigAuth = getattr(E, "config-auth")
     Version = E.version
     DeviceId = getattr(E, "device-id")
@@ -300,7 +369,7 @@ def _create_auth_init_request(host, url, version, no_cert=False):
         {"client": "vpn", "type": "init", "aggregate-auth-version": "2"},
         Version({"who": "vpn"}, version),
         DeviceId("linux-64"),
-        GroupSelect(host.name),
+        GroupSelect(host.name if group is None else group),
         GroupAccess(url),
         Capabilities(AuthMethod("single-sign-on-v2")),
     )
@@ -353,6 +422,40 @@ def _first_form_action(auth_node, response_url=None):
     return None
 
 
+def _group_list(auth_node):
+    """Return ``(options, selected)`` from a ``<select name="group_list">``.
+
+    Cisco gateways send this when the requested ``<group-select>`` is not a
+    valid group. Options may carry a ``value`` attribute; when they don't,
+    the visible text is the value openconnect sends back.
+    """
+    selects = auth_node.xpath('.//*[local-name()="select"][@name="group_list"]')
+    if not selects:
+        return [], None
+    options, selected = [], None
+    for opt in selects[0].xpath('./*[local-name()="option"]'):
+        value = (opt.get("value") or (opt.text or "")).strip()
+        if not value:
+            continue
+        options.append(value)
+        if (opt.get("selected") or "").lower() == "true":
+            selected = value
+    return options, selected
+
+
+def _match_group(requested, groups):
+    """Case-insensitive exact match of *requested* against *groups*."""
+    want = (requested or "").strip().casefold()
+    for group in groups:
+        if group and group.strip().casefold() == want:
+            return group
+    return None
+
+
+def _format_groups(groups):
+    return ", ".join(f"'{g}'" for g in groups) or "(none)"
+
+
 def _auth_field(auth_node, name):
     try:
         return auth_node[name]
@@ -380,6 +483,10 @@ def parse_auth_request_response(xml, response_url=None):
         login_final_url = _auth_field(xml.auth, "sso-v2-login-final") or login_url
         token_cookie_name = _auth_field(xml.auth, "sso-v2-token-cookie-name") or "webvpn"
         if not login_url:
+            groups, selected = _group_list(xml.auth)
+            if groups:
+                logger.info("Gateway requested a group selection", groups=groups, selected=selected)
+                return GroupSelectResponse(groups=groups, selected=selected)
             child_names = [etree.QName(child).localname for child in xml.auth.iterchildren()]
             raise AuthResponseError(
                 "SAML auth-request is missing sso-v2-login and no form action fallback "
@@ -421,6 +528,14 @@ class AuthRequestResponse:
     login_final_url = attr.ib(converter=str)
     token_cookie_name = attr.ib(converter=str)
     opaque = attr.ib()
+
+
+@attr.s
+class GroupSelectResponse:
+    """Init response that offers a group list instead of an SSO login URL."""
+
+    groups = attr.ib(factory=list)
+    selected = attr.ib(default=None)
 
 
 @attr.s

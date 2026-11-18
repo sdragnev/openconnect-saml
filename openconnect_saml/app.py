@@ -20,6 +20,7 @@ from openconnect_saml.authenticator import (
     CHROME_MODE,
     HEADLESS_MODE,
     Authenticator,
+    AuthGroupSelectionError,
     AuthResponseError,
 )
 from openconnect_saml.browser import Terminated
@@ -91,6 +92,9 @@ def run(args):
     except Terminated:
         logger.warning("Browser window terminated, exiting")
         return _bail(2)
+    except AuthGroupSelectionError as exc:
+        logger.error(str(exc))
+        return _bail(3)
     except AuthResponseError as exc:
         logger.error(
             f'Required attributes not found in response ("{exc}", '
@@ -792,6 +796,41 @@ async def select_profile(profile_list):
     return selection
 
 
+def _prompt_for_vpn_group(groups, selected, requested):
+    """Ask the user to pick a VPN group when the gateway offers a list.
+
+    Returns ``None`` (→ clear error listing the groups) when stdin is not a
+    terminal, so headless/service runs never block on input.
+    """
+    if not groups or not sys.stdin.isatty():
+        return None
+    out = sys.stderr
+    if requested:
+        out.write(f"\nVPN group '{requested}' is not offered by the gateway.\n")
+    out.write("The gateway offers these groups:\n")
+    for i, group in enumerate(groups, 1):
+        marker = " (default)" if group == selected else ""
+        out.write(f"  {i}) {group}{marker}\n")
+    out.flush()
+    while True:
+        try:
+            answer = input(f"Select group [1-{len(groups)}]: ").strip()
+        except EOFError:
+            return None
+        if not answer and selected:
+            choice = selected
+        elif answer.isdigit() and 1 <= int(answer) <= len(groups):
+            choice = groups[int(answer) - 1]
+        else:
+            out.write("Invalid selection.\n")
+            continue
+        out.write(
+            f'Tip: pass --authgroup "{choice}" (or set the profile\'s name to it) '
+            "to skip this prompt next time.\n"
+        )
+        return choice
+
+
 def authenticate_to(
     host,
     proxy,
@@ -825,6 +864,7 @@ def authenticate_to(
         chrome_channel=chrome_channel,
         chrome_executable=chrome_executable,
         chrome_user_data_dir=chrome_user_data_dir,
+        group_selector=_prompt_for_vpn_group,
     ).authenticate(display_mode)
 
 
